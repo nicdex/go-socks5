@@ -1,17 +1,17 @@
 package go_socks5
 
 import (
-	"net"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"strconv"
-	"encoding/binary"
 )
 
 type Connection struct {
-	client   *Client
-	conn	 net.Conn
+	client *Client
+	conn   net.Conn
 }
 
 func (c Connection) writePacket(buf []byte) error {
@@ -64,7 +64,7 @@ func (c Connection) authenticate() error {
 	copy(buf[2:], c.client.Username)
 	buf[2+username_len] = byte(password_len)
 	copy(buf[3+username_len:], c.client.Password)
-	if err := c.writePacket(buf[0:3+username_len+password_len]); err != nil {
+	if err := c.writePacket(buf[0 : 3+username_len+password_len]); err != nil {
 		return err
 	}
 	if rc, err := c.readPacket(buf); err != nil {
@@ -76,6 +76,33 @@ func (c Connection) authenticate() error {
 	}
 
 	return nil
+}
+
+func (c Connection) bind(laddr *net.TCPAddr) (*net.TCPAddr, error) {
+	buf := make([]byte, MaxProtoSize)
+	buf[0] = 5 // Ver
+	buf[1] = 2 // bind
+	buf[2] = 0 // Reserved
+	buf[3] = 1 // IPv4
+	copy(buf[4:8], laddr.IP.To4())
+	binary.BigEndian.PutUint16(buf[8:10], uint16(laddr.Port))
+	//TODO support ipv6, domain
+	if err := c.writePacket(buf[0:10]); err != nil {
+		return nil, err
+	}
+
+	if rc, err := c.readPacket(buf); err != nil {
+		return nil, err
+	} else if rc != 10 {
+		return nil, errors.New(fmt.Sprintf("proxy: unexpected response packet size: %d", rc))
+	} else if buf[1] != 0 {
+		return nil, errors.New(fmt.Sprintf("proxy: udp associate failed: status=%x", buf[1]))
+	}
+
+	return &net.TCPAddr{
+		IP:   buf[4:8],
+		Port: int(binary.BigEndian.Uint16(buf[8:10])),
+	}, nil
 }
 
 func (c Connection) udpAssociate(laddr *net.UDPAddr) (*net.UDPAddr, error) {
@@ -107,18 +134,18 @@ func (c Connection) udpAssociate(laddr *net.UDPAddr) (*net.UDPAddr, error) {
 	}, nil
 }
 
-func (c Connection) connect(address string) error {
+func (c Connection) connect(address string) (*net.TCPAddr, error) {
 	host, portStr, err := net.SplitHostPort(address)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return errors.New("proxy: failed to parse port number: " + portStr)
+		return nil, errors.New("proxy: failed to parse port number: " + portStr)
 	}
 	if port < 1 || port > 0xffff {
-		return errors.New("proxy: port number out of range: " + portStr)
+		return nil, errors.New("proxy: port number out of range: " + portStr)
 	}
 
 	buf := make([]byte, MaxProtoSize)
@@ -138,7 +165,7 @@ func (c Connection) connect(address string) error {
 	} else {
 		host_len := len(host)
 		if host_len > 255 {
-			return errors.New("proxy: hostname too long: " + host)
+			return nil, errors.New("proxy: hostname too long: " + host)
 		}
 		buf[3] = 3 // domain
 		buf[size] = byte(host_len)
@@ -149,18 +176,23 @@ func (c Connection) connect(address string) error {
 	size += 2
 
 	if err := c.writePacket(buf[:size]); err != nil {
-		return err
+		return nil, err
 	}
 
 	if rc, err := c.readPacket(buf); err != nil {
-		return err
+		return nil, err
 	} else if rc < 10 {
-		return errors.New("unexpected response")
+		return nil, errors.New("unexpected response")
 	} else if buf[1] != 0 {
-		return errors.New(fmt.Sprintf("connect failed: %d", buf[1]))
+		return nil, errors.New(fmt.Sprintf("connect failed: %d", buf[1]))
 	}
 
-	//TODO should we use the returned bind address as LocalAddr???
+	return &net.TCPAddr{
+		IP:   buf[4:8],
+		Port: int(binary.LittleEndian.Uint16(buf[8:10])),
+	}, nil
+}
 
-	return nil
+func (c *Connection) close() error {
+	return c.conn.Close()
 }
